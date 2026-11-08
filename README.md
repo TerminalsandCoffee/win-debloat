@@ -21,8 +21,9 @@ Built for people who want control of their Desktop without gutting security base
 ## Quick start
 
 ```powershell
-# From an elevated PowerShell session is safest for uninstall later
-Set-ExecutionPolicy -Scope Process Bypass -Force
+# From an elevated PowerShell session is safest for uninstall later.
+# Process scope only; do not change the machine execution policy.
+Set-ExecutionPolicy -Scope Process RemoteSigned -Force
 cd path\to\win-debloat
 
 # 1) Unhook Desktop from OneDrive

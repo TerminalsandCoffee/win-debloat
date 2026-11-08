@@ -8,12 +8,14 @@
 .NOTES
   Does not disable Defender, Windows Update, BitLocker, or SmartScreen.
   Edit -Keepers (or the default list below) before running if you want specific files preserved.
+  Supports -WhatIf and -Confirm.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   [switch]$SkipCopyKeepers,
-  # Names of files/folders on OneDrive\Desktop to copy to local Desktop before archive.
-  [string[]]$Keepers = @()
+  # Single-segment names of files/folders on OneDrive\Desktop to copy to local Desktop before archive.
+  [string[]]$Keepers = @(),
+  [switch]$SkipExplorerRestart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,20 +27,36 @@ $shellFolders2 = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell
 
 function Write-Step([string]$msg) { Write-Host ""; Write-Host "==> $msg" -ForegroundColor Cyan }
 
+function Assert-KeeperName([string]$name) {
+  if ([string]::IsNullOrWhiteSpace($name) -or $name -match '[\\/]' -or $name.Contains('..')) {
+    throw "Keeper '$name' must be a single file or folder name with no path separators or '..'."
+  }
+}
+
 Write-Step "Local Desktop: $localDesktop"
 Write-Step "OneDrive Desktop: $odDesktop"
-New-Item -ItemType Directory -Force -Path $localDesktop | Out-Null
-New-Item -ItemType Directory -Force -Path $archive | Out-Null
+if ($PSCmdlet.ShouldProcess($localDesktop, 'Ensure local Desktop and archive folders exist')) {
+  New-Item -ItemType Directory -Force -Path $localDesktop | Out-Null
+  New-Item -ItemType Directory -Force -Path $archive | Out-Null
+}
 
 if (-not $SkipCopyKeepers -and $Keepers.Count -gt 0 -and (Test-Path -LiteralPath $odDesktop)) {
   Write-Step 'Copying keepers from OneDrive Desktop to local Desktop'
   foreach ($name in $Keepers) {
+    Assert-KeeperName $name
     $src = Join-Path $odDesktop $name
+    $srcFull = [System.IO.Path]::GetFullPath($src)
+    $odFull = [System.IO.Path]::GetFullPath($odDesktop)
+    if (-not $srcFull.StartsWith($odFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Keeper '$name' resolved outside OneDrive Desktop."
+    }
     if (Test-Path -LiteralPath $src) {
       $dst = Join-Path $localDesktop $name
       if (-not (Test-Path -LiteralPath $dst)) {
-        Copy-Item -LiteralPath $src -Destination $dst -Force
-        Write-Host "  kept: $name"
+        if ($PSCmdlet.ShouldProcess($src, "Copy keeper to $dst")) {
+          Copy-Item -LiteralPath $src -Destination $dst -Force
+          Write-Host "  kept: $name"
+        }
       } else {
         Write-Host "  already on local: $name"
       }
@@ -53,6 +71,7 @@ if (Test-Path -LiteralPath $odDesktop) {
     if (Test-Path -LiteralPath $target) {
       $target = Join-Path $archive ($_.Name + '_' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
     }
+    if (-not $PSCmdlet.ShouldProcess($_.FullName, "Archive to $target")) { return }
     try {
       Move-Item -LiteralPath $_.FullName -Destination $target -Force
       Write-Host "  archived: $($_.Name)"
@@ -72,11 +91,13 @@ if (Test-Path -LiteralPath $odDesktop) {
 }
 
 Write-Step 'Rewriting Desktop known-folder registry to local Desktop'
-Set-ItemProperty -Path $shellFolders -Name 'Desktop' -Value $localDesktop -Type ExpandString
-Set-ItemProperty -Path $shellFolders2 -Name 'Desktop' -Value $localDesktop
-$guidName = '{754AC886-DF64-4CBA-86B5-F7FBF4FBCEF5}'
-if (Get-ItemProperty -Path $shellFolders -Name $guidName -ErrorAction SilentlyContinue) {
-  Set-ItemProperty -Path $shellFolders -Name $guidName -Value $localDesktop -Type ExpandString
+if ($PSCmdlet.ShouldProcess($shellFolders, 'Point Desktop known folders at local Desktop')) {
+  Set-ItemProperty -Path $shellFolders -Name 'Desktop' -Value $localDesktop -Type ExpandString
+  Set-ItemProperty -Path $shellFolders2 -Name 'Desktop' -Value $localDesktop
+  $guidName = '{754AC886-DF64-4CBA-86B5-F7FBF4FBCEF5}'
+  if (Get-ItemProperty -Path $shellFolders -Name $guidName -ErrorAction SilentlyContinue) {
+    Set-ItemProperty -Path $shellFolders -Name $guidName -Value $localDesktop -Type ExpandString
+  }
 }
 
 Write-Step 'Clearing OneDrive KFM desktop flags if present'
@@ -86,16 +107,24 @@ if (Test-Path $odAccounts) {
     $p = $_.PSPath
     foreach ($n in @('KfmStateDesktop','KfmFoldersProtected')) {
       if (Get-ItemProperty -Path $p -Name $n -ErrorAction SilentlyContinue) {
-        try { Set-ItemProperty -Path $p -Name $n -Value 0 -ErrorAction SilentlyContinue } catch {}
+        try {
+          Set-ItemProperty -Path $p -Name $n -Value 0
+        } catch {
+          Write-Warning "Could not clear $n on $p"
+        }
       }
     }
   }
 }
 
-Write-Step 'Restarting Explorer'
-Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-Start-Process explorer.exe
+if (-not $SkipExplorerRestart) {
+  Write-Step 'Restarting Explorer'
+  if ($PSCmdlet.ShouldProcess('explorer', 'Restart Explorer')) {
+    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Start-Process explorer.exe
+  }
+}
 
 Write-Host ""
 Write-Host "Done. Desktop should now be: $localDesktop" -ForegroundColor Green
